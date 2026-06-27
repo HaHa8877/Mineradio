@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "sources": [],
+  "preferences": {
+    "autoFallback": true,
+    "fallbackDelay": 2000
+  }
+}

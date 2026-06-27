@@ -1,3 +1,8 @@
+// 修复 Windows 控制台中文乱码 (UTF-8 → GBK 转换)
+if (process.platform === 'win32') {
+  try { require('child_process').execSync('chcp 65001', { stdio: 'ignore' }); } catch (e) {}
+}
+
 const { app, BrowserWindow, ipcMain, shell, screen, session, globalShortcut, dialog } = require('electron');
 const net = require('net');
 const path = require('path');

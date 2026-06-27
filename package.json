@@ -1,13 +1,13 @@
 {
   "name": "mineradio",
   "productName": "Mineradio",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "沉浸式音乐播放器，融合天气电台、歌词舞台、粒子视觉和 3D 歌单架。",
   "author": "Mineradio",
   "main": "desktop/main.js",
   "private": true,
   "scripts": {
-    "start": "electron .",
+    "start": "cmd /c \"chcp 65001 > nul && .\\\\node_modules\\\\electron\\\\dist\\\\electron.exe .\"",
     "build:win": "electron-builder --win nsis",
     "build:win:dir": "electron-builder --win dir"
   },
@@ -25,10 +25,15 @@
     "files": [
       "desktop/**/*",
       "public/**/*",
+      "sources/**/*.js",
+      "sources/sources.default.json",
       "build/**/*",
       "server.js",
       "dj-analyzer.js",
       "package.json",
+      "!sources/sources.json",
+      "!*.cookie",
+      "!*qq-cookie*",
       "!public/index.*.html",
       "public/index.html"
     ],
@@ -92,5 +97,8 @@
     "electron": "^42.4.1",
     "electron-builder": "^26.15.3",
     "rcedit": "^5.0.2"
+  },
+  "overrides": {
+    "@noble/hashes": "1.7.1"
   }
 }

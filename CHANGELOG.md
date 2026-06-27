@@ -1,14 +1,19 @@
 # Changelog
 
-## v1.1.1
+## v1.2.0
 
-- P0 installer safety fix: installation now defaults to the first available non-C drive from `D:\Mineradio` through `Z:\Mineradio`; it falls back to `C:\Mineradio` only when no D-Z drive exists.
-- The installer now forces the target path into a dedicated `Mineradio` folder, blocks non-empty non-Mineradio-owned targets, and blocks C drive installs when a D-Z drive is available.
-- Existing registered installs in a dedicated `...\Mineradio` folder are adopted in place so users can run the new setup over their current installation and receive the safe uninstaller.
-- Existing dedicated `...\Mineradio` folders that already contain Mineradio files can be overwritten even if they were created before the new safety marker existed.
-- The new uninstaller no longer removes the whole installation root or app subfolders recursively; it deletes only known top-level Mineradio/Electron files and leaves unrelated files in place.
-- Legacy uninstallers without the new safety marker are skipped during install; the setup deletes only the old `Uninstall Mineradio.exe` file and registry entry so it cannot indirectly trigger an older unsafe uninstall routine.
-- Installer/uninstaller safety fixes require the full setup package; quick patch JSON files must not be used as the only delivery path for this issue.
+- 外置音源（Navidrome）重大完善：连接、搜索、播放、歌词全链路修复与增强。
+- Navidrome 适配器修复：补全 Subsonic API `.view` 端点后缀；baseUrl 自动去重 `/rest` 和默认端口；认证缓存改为按音源实例隔离，多 ND 服务器不再串号。
+- 外置音源配置修复：保存时变量引用错误和路由拦截导致无法保存；密码掩码机制完善，保存后自动重载配置防止真实密码泄漏和误覆盖；加密码显示切换按钮（眼睛图标），支持从服务端拉取真实密码校验。
+- 多音源实例路由：搜索结果携带具体音源实例 ID，歌词和播放 URL 精确路由到对应服务器，不再错误地匹配到第一个同类型音源。
+- 歌曲来源标签：搜索结果、迷你队列和完整队列中均显示 NE/QQ/ND 来源标签；歌曲详情页来源字段正确识别外置音源；音质降级提示不再误报为网易云。
+- 歌词系统增强：外部音源无歌词时自动回退网易云；网易云不可达时继续回退 QQ 音乐；智能对比选择更优歌词（优先逐字 yrc，其次行级 lrc）；短于 25 字符的占位文本视为无歌词并触发回退。
+- 自定义歌词新增 URL 获取模式：支持 `{name}/{artist}/{album}/{id}` 占位符，一键从 LRC 链接拉取歌词。
+- 外置音源配置 UI 改进：自定义下拉框替换原生 select；删除按钮移至卡片头部始终可见；自动换源/切换延迟选项风格统一。
+- 详情页增强：外置音源歌曲的评论和歌手热门歌曲通过名+歌手名从网易云搜索匹配获取。
+- Windows 控制台中文乱码修复：启动脚本和主进程双重设置 UTF-8 编码。
+- `sources/` 目录加入构建产物，修复安装包缺少外置音源适配器的问题。
+- 服务端 `/api/lyric`、`/api/song/comments`、`/api/artist/detail` 新增 name+artist 搜索模式，支持从文本查找匹配歌词/评论/歌手。
 
 ## v1.1.0
 

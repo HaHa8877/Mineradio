@@ -4,6 +4,7 @@
 //  - 扫码登录 (login_qr_*) + cookie 持久化 (./.cookie)
 //  - 试听检测 (freeTrialInfo) + 全 quality 探测
 //  - 所有受保护 API 都会带上已登录用户的 cookie
+//  - 外部音源（Navidrome / LX Music 等）通过 sources/ 目录管理
 // ====================================================================
 const {
   search,
@@ -53,6 +54,15 @@ const tls = require('tls');
 const { once } = require('events');
 const { fileURLToPath } = require('url');
 const { analyzePodcastDjStream, analyzePodcastDjIntro } = require('./dj-analyzer');
+const {
+  loadSourcesConfig, saveSourcesConfig, getEnabledSources, loadAdapter,
+  searchAllSources, resolveSongUrl, resolveLyric, resolveUserPlaylists, resolvePlaylistTracks,
+  findSourceConfig,
+  createLXMusicAdapter, proxyAudioUrl: sourcesProxyAudio
+} = (() => {
+  try { return require('./sources/source-manager'); }
+  catch(e) { console.warn('[Sources] module not available:', e.message); return {}; }
+})();
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -3557,6 +3567,280 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ====================================================================
+  //  外部音源 API (Navidrome / LX Music / 自定义)
+  // ====================================================================
+
+  // 获取音源配置
+  if (pn === '/api/sources/config' && req.method === 'GET') {
+    const config = loadSourcesConfig && loadSourcesConfig() || { sources: [], preferences: {} };
+    const reveal = url.searchParams.get('reveal') === '1';
+    sendJSON(res, {
+      sources: (config.sources || []).map(s => ({
+        id: s.id, name: s.name, type: s.type,
+        enabled: s.enabled, priority: s.priority,
+        fallbackOnly: s.fallbackOnly,
+        config: {
+          type: s.config && s.config.type,
+          baseUrl: s.config && s.config.baseUrl,
+          username: s.config && s.config.username,
+          // 密码有值则返回掩码，无值则返回空；reveal=1 时返回真实密码
+          password: reveal
+            ? (s.config && s.config.password || '')
+            : (s.config && s.config.password ? '******' : ''),
+          sourceFile: s.config && s.config.sourceFile,
+        },
+      })),
+      preferences: config.preferences || {},
+    });
+    return;
+  }
+
+  // 更新音源配置
+  if (pn === '/api/sources/config' && req.method === 'POST') {
+    try {
+      const body = await readRequestBody(req);
+      const existing = loadSourcesConfig && loadSourcesConfig() || { sources: [], preferences: {} };
+      if (body.sources) {
+        // 字段级合并：如果前端没传 password/username，保留已有的
+        body.sources.forEach((srcReq) => {
+          const existingSrc = (existing.sources || []).find(s => s.id === srcReq.id);
+          if (existingSrc && existingSrc.config && srcReq.config) {
+            // 密码未传或为空字符串 → 保留已有
+            if ((!srcReq.config.password || srcReq.config.password === '******') && existingSrc.config.password) {
+              srcReq.config.password = existingSrc.config.password;
+            }
+            if (!srcReq.config.username && existingSrc.config.username) {
+              srcReq.config.username = existingSrc.config.username;
+            }
+            // 保留其他已有配置字段
+            Object.keys(existingSrc.config).forEach(k => {
+              if (!(k in (srcReq.config || {}))) {
+                srcReq.config = srcReq.config || {};
+                srcReq.config[k] = existingSrc.config[k];
+              }
+            });
+          }
+        });
+        existing.sources = body.sources;
+      }
+      if (body.preferences) existing.preferences = body.preferences;
+      if (saveSourcesConfig) saveSourcesConfig(existing);
+      sendJSON(res, { ok: true, updatedAt: Date.now() });
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message }, 500);
+    }
+    return;
+  }
+
+  // 测试音源连接
+  if (pn === '/api/sources/test') {
+    try {
+      const sourceId = url.searchParams.get('id') || '';
+      const adapter = loadAdapter && loadAdapter(sourceId);
+      if (!adapter) { sendJSON(res, { ok: false, error: 'ADAPTER_NOT_FOUND' }, 404); return; }
+      if (typeof adapter.testConnection !== 'function') {
+        sendJSON(res, { ok: true, message: 'No test available for this source' });
+        return;
+      }
+      // 允许前端通过 query 参数覆盖 baseUrl/username/password，方便实时测试
+      const overrides = {};
+      const baseUrl = url.searchParams.get('baseUrl');
+      const username = url.searchParams.get('username');
+      const password = url.searchParams.get('password');
+      if (baseUrl) overrides.baseUrl = baseUrl;
+      if (username) overrides.username = username;
+      // '******' 是掩码，表示用户未修改密码，保留已有
+      if (password && password !== '******') overrides.password = password;
+      const config = loadSourcesConfig && loadSourcesConfig() || {};
+      const sourceCfg = findSourceConfig(config, sourceId);
+      const mergedConfig = Object.assign({}, sourceCfg && sourceCfg.config, overrides);
+      const result = await adapter.testConnection(mergedConfig);
+      sendJSON(res, result);
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message }, 500);
+    }
+    return;
+  }
+
+  // 外部音源搜索
+  if (pn === '/api/sources/search') {
+    try {
+      const kw = String(url.searchParams.get('keywords') || '').trim();
+      const limit = Math.max(4, Math.min(30, parseInt(url.searchParams.get('limit') || '15', 10) || 15));
+      const providerId = url.searchParams.get('provider') || '';
+      if (!kw) { sendJSON(res, { songs: [] }); return; }
+
+      if (providerId && loadAdapter) {
+        const adapter = loadAdapter(providerId);
+        if (!adapter || typeof adapter.search !== 'function') {
+          sendJSON(res, { provider: providerId, error: 'ADAPTER_NOT_FOUND', songs: [] }, 404);
+          return;
+        }
+        const config = loadSourcesConfig && loadSourcesConfig() || {};
+        const sourceCfg = findSourceConfig(config, providerId);
+        const songs = await adapter.search(kw, limit, sourceCfg && sourceCfg.config);
+        const srcId = sourceCfg ? sourceCfg.id : providerId;
+        sendJSON(res, { provider: providerId, songs: (songs || []).map(s => Object.assign({}, s, { provider: adapter.id, source: srcId, sourceType: adapter.id })) });
+      } else {
+        const songs = searchAllSources ? await searchAllSources(kw, limit) : [];
+        sendJSON(res, { songs });
+      }
+    } catch (err) {
+      console.error('[SourcesSearch]', err);
+      sendJSON(res, { error: err.message, songs: [] }, 500);
+    }
+    return;
+  }
+
+  // 外部音源取歌曲 URL
+  if (pn === '/api/sources/song/url') {
+    try {
+      const providerId = url.searchParams.get('provider') || '';
+      const songId = url.searchParams.get('id') || '';
+      const quality = url.searchParams.get('quality') || '';
+      if (!providerId || !songId) { sendJSON(res, { url: '', playable: false, error: 'MISSING_PARAMS' }, 400); return; }
+
+      if (resolveSongUrl) {
+        const songSource = url.searchParams.get('source') || providerId;
+        const song = { id: songId, provider: providerId, source: songSource,
+          name: url.searchParams.get('name') || '', artist: url.searchParams.get('artist') || '' };
+        const info = await resolveSongUrl(song, quality);
+        if (info && info.url) {
+          sendJSON(res, info);
+          return;
+        }
+      }
+      sendJSON(res, { provider: providerId, url: '', playable: false, error: 'URL_UNAVAILABLE' });
+    } catch (err) {
+      console.error('[SourcesSongUrl]', err);
+      sendJSON(res, { url: '', playable: false, error: err.message }, 500);
+    }
+    return;
+  }
+
+  // 外部音源歌词
+  if (pn === '/api/sources/lyric') {
+    try {
+      const providerId = url.searchParams.get('provider') || '';
+      const songId = url.searchParams.get('id') || '';
+      const name = url.searchParams.get('name') || '';
+      const artist = url.searchParams.get('artist') || '';
+      if (!providerId) { sendJSON(res, { lyric: '' }, 400); return; }
+
+      const songSource = url.searchParams.get('source') || providerId;
+      const song = { id: songId, provider: providerId, source: songSource, name, artist };
+      const result = resolveLyric ? await resolveLyric(song) : null;
+
+      // 网易云回退：如果外部歌词不够好（无 yrc 或太短），尝试从网易云获取更优歌词
+      var extLyric = (result && (result.lyric || result.tlyric || '')).trim();
+      var extYrc = (result && (result.yrc || '')).trim();
+      var lyricLen = extLyric.replace(/\s/g, '').length;
+      var hasGoodLyric = lyricLen > 25; // 太短可能是占位文本
+      var hasYrc = !!extYrc.replace(/\s/g, '');
+      console.log('[SourcesLyric] hasLyric:', lyricLen > 0, 'len:', lyricLen, 'hasYrc:', hasYrc, 'name:', name);
+
+      // 外部歌词不理想 → 尝试网易云，再尝试 QQ
+      if (name && (!hasGoodLyric || !hasYrc)) {
+        // 第一回退：网易云
+        console.log('[SourcesLyric] trying netease for:', name, !hasGoodLyric ? '(short/empty lyric)' : '(no yrc)');
+        try {
+          const kw = (name + ' ' + (artist || '')).trim();
+          const songs = await handleSearch(kw, 3);
+          const match = songs.find(function(s){
+            return (s.name || '').toLowerCase() === name.toLowerCase();
+          }) || songs[0];
+          if (match && match.id) {
+            let neBody = {};
+            try {
+              if (typeof lyric_new === 'function') {
+                const nr = await lyric_new({ id: match.id, cookie: userCookie, timestamp: Date.now() });
+                neBody = nr.body || {};
+              }
+            } catch (e) {}
+            if (!((neBody.lrc && neBody.lrc.lyric) || (neBody.yrc && neBody.yrc.lyric))) {
+              const r = await lyric({ id: match.id, cookie: userCookie, timestamp: Date.now() });
+              neBody = r.body || neBody || {};
+            }
+            const neLyric = (neBody.lrc && neBody.lrc.lyric) || '';
+            const neYrc = (neBody.yrc && neBody.yrc.lyric) || '';
+            var neLen = (neLyric || neYrc || '').replace(/\s/g, '').length;
+            if (neLen > lyricLen || (neYrc && !hasYrc)) {
+              console.log('[SourcesLyric] using netease:', name, 'neLen:', neLen, 'hasYrc:', !!neYrc);
+              sendJSON(res, { provider: providerId, lyric: neLyric, tlyric: (neBody.tlyric && neBody.tlyric.lyric) || '', yrc: neYrc, source: 'netease-fallback', fallbackFrom: providerId });
+              return;
+            }
+            console.log('[SourcesLyric] netease not better (neLen:', neLen, ')');
+          }
+        } catch (e) {
+          console.warn('[SourcesLyric] netease unreachable:', e && (e.message || e.code || String(e).slice(0,100)));
+        }
+
+        // 第二回退：QQ 音乐
+        console.log('[SourcesLyric] trying QQ for:', name);
+          try {
+            const qqSongs = await handleQQSearch((name + ' ' + (artist || '')).trim(), 3);
+            const qqMatch = qqSongs.find(function(s){
+              return (s.name || '').toLowerCase() === name.toLowerCase();
+            }) || qqSongs[0];
+            if (qqMatch) {
+              const qqMid = qqMatch.mid || qqMatch.songmid || qqMatch.id || '';
+              const qqId = qqMatch.qqId || qqMatch.id || '';
+              if (qqMid || qqId) {
+                const qqLyricData = await handleQQLyric(qqMid, qqId);
+                const qqLyric = qqLyricData.lyric || '';
+                const qqYrc = qqLyricData.qrc || '';
+                var qqLen = (qqLyric || qqYrc || '').replace(/\s/g, '').length;
+                if (qqLen > lyricLen || (qqYrc && !hasYrc)) {
+                  console.log('[SourcesLyric] using QQ:', name, 'qqLen:', qqLen, 'hasYrc:', !!qqYrc);
+                  sendJSON(res, { provider: providerId, lyric: qqLyric, tlyric: qqLyricData.trans || '', yrc: qqYrc, source: 'qq-fallback', fallbackFrom: providerId });
+                  return;
+                }
+                console.log('[SourcesLyric] QQ not better (qqLen:', qqLen, ')');
+              }
+            }
+          } catch (e) {
+            console.warn('[SourcesLyric] QQ unreachable:', e && (e.message || e.code || String(e).slice(0,100)));
+          }
+      }
+
+      sendJSON(res, result || { provider: providerId, lyric: '', tlyric: '', source: 'empty' });
+    } catch (err) {
+      console.error('[SourcesLyric]', err);
+      sendJSON(res, { lyric: '', error: err.message }, 500);
+    }
+    return;
+  }
+
+  // 外部音源用户歌单
+  if (pn === '/api/sources/playlists') {
+    try {
+      const providerId = url.searchParams.get('provider') || '';
+      if (!providerId) { sendJSON(res, { playlists: [] }, 400); return; }
+      const playlists = resolveUserPlaylists ? await resolveUserPlaylists(providerId) : [];
+      sendJSON(res, { provider: providerId, playlists });
+    } catch (err) {
+      console.error('[SourcesPlaylists]', err);
+      sendJSON(res, { provider: '', error: err.message, playlists: [] }, 500);
+    }
+    return;
+  }
+
+  // 外部音源歌单曲目
+  if (pn === '/api/sources/playlist/tracks') {
+    try {
+      const providerId = url.searchParams.get('provider') || '';
+      const playlistId = url.searchParams.get('id') || '';
+      if (!providerId || !playlistId) { sendJSON(res, { tracks: [] }, 400); return; }
+      const tracks = resolvePlaylistTracks ? await resolvePlaylistTracks(providerId, playlistId) : [];
+      sendJSON(res, { provider: providerId, playlistId, tracks });
+    } catch (err) {
+      console.error('[SourcesPlaylistTracks]', err);
+      sendJSON(res, { error: err.message, tracks: [] }, 500);
+    }
+    return;
+  }
+
   if (pn === '/api/podcast/search') {
     try {
       const kw = String(url.searchParams.get('keywords') || '').trim();
@@ -3990,7 +4274,23 @@ const server = http.createServer(async (req, res) => {
   // ---------- 歌词 ----------
   if (pn === '/api/lyric') {
     try {
-      const id = url.searchParams.get('id');
+      let id = url.searchParams.get('id');
+      const name = url.searchParams.get('name') || '';
+      const artist = url.searchParams.get('artist') || '';
+
+      // 支持 name+artist 搜索模式: 先搜网易云找匹配歌曲ID
+      if (!id && name) {
+        const kw = (name + ' ' + artist).trim();
+        const songs = await handleSearch(kw, 3);
+        const match = songs.find(function(s){
+          return (s.name || '').toLowerCase() === name.toLowerCase();
+        }) || songs[0];
+        if (match && match.id) {
+          console.log('[Lyric] search match:', name, '→', match.name, match.id);
+          id = match.id;
+        }
+      }
+
       if (!id) { sendJSON(res, { error: 'Missing song id', lyric: '' }, 400); return; }
       let body = {};
       let source = 'lyric';
@@ -4024,9 +4324,21 @@ const server = http.createServer(async (req, res) => {
   // ---------- 歌曲评论 ----------
   if (pn === '/api/song/comments') {
     try {
-      const id = url.searchParams.get('id');
+      let id = url.searchParams.get('id');
+      const name = url.searchParams.get('name') || '';
       const limit = Math.max(6, Math.min(50, parseInt(url.searchParams.get('limit') || '20', 10) || 20));
       const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+
+      // name 搜索模式：先搜索网易云找匹配歌曲ID
+      if (!id && name) {
+        const songs = await handleSearch(name, 3);
+        const match = songs[0];
+        if (match && match.id) {
+          console.log('[Comments] search match:', name, '→', match.name, match.id);
+          id = match.id;
+        }
+      }
+
       if (!id) { sendJSON(res, { error: 'Missing song id', comments: [] }, 400); return; }
       const r = await comment_music({ id, limit, offset, cookie: userCookie, timestamp: Date.now() });
       const body = r.body || r || {};
@@ -4049,8 +4361,26 @@ const server = http.createServer(async (req, res) => {
   // ---------- 歌手主页 / 热门歌曲 ----------
   if (pn === '/api/artist/detail') {
     try {
-      const id = url.searchParams.get('id');
+      let id = url.searchParams.get('id');
+      const name = url.searchParams.get('name') || '';
       const limit = Math.max(10, Math.min(80, parseInt(url.searchParams.get('limit') || '30', 10) || 30));
+
+      // name 搜索模式：先搜索网易云找匹配歌手ID
+      if (!id && name) {
+        const songs = await handleSearch(name, 5);
+        // 从搜索结果中提取歌手的 artistId
+        for (var si = 0; si < songs.length; si++) {
+          var s = songs[si];
+          if (s.artistId) { id = String(s.artistId); break; }
+          var ars = s.artists || [];
+          for (var ai = 0; ai < ars.length; ai++) {
+            if (ars[ai] && ars[ai].id) { id = String(ars[ai].id); break; }
+          }
+          if (id) break;
+        }
+        console.log('[ArtistDetail] search name:', name, '→ id:', id || 'not found');
+      }
+
       if (!id) { sendJSON(res, { error: 'Missing artist id', songs: [] }, 400); return; }
       let detailBody = {};
       try {
